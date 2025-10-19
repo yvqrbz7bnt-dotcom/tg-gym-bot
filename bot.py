@@ -1,6 +1,8 @@
-# requirements: aiogram==3.4.1 aiosqlite==0.20.0
-import asyncio, os, aiosqlite
-from aiogram import Bot, Dispatcher, F
+# tg-gym-bot — версия для aiogram 2.25.1 (совместима с iSH)
+import os
+import aiosqlite
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 TOKEN = os.getenv("TG_TOKEN")
@@ -28,6 +30,9 @@ PLAN = {
         {"exercise":"Triceps Pushdown (Straight)","sets":4,"reps":15,"default":32.0,"min_step":4.5},
     ]
 }
+
+bot = Bot(TOKEN)
+dp = Dispatcher(bot)
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
@@ -71,39 +76,45 @@ async def set_weight(db, user_id, ex_name, weight=None, fails=None):
 def kb_for_set(ex, w):
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=f"✅ {ex} {w:.1f} — легко"), KeyboardButton(text=f"🟡 {ex} {w:.1f} — норм")],
+            [KeyboardButton(text=f"✅ {ex} {w:.1f} — легко"),
+             KeyboardButton(text=f"🟡 {ex} {w:.1f} — норм")],
             [KeyboardButton(text=f"❌ {ex} {w:.1f} — не сделал")]
         ],
         resize_keyboard=True
     )
 
-bot = Bot(TOKEN)
-dp = Dispatcher()
-
-@dp.message(F.text == "/start")
+@dp.message_handler(commands=['start'])
 async def start(m: Message):
+    await init_db()
     async with aiosqlite.connect(DB) as db:
         await get_user(db, m.from_user.id)
     await m.answer("Готов! Команды: /today — план, /n 2.5 — шаг прибавки, /swap — смена дня.")
 
-@dp.message(F.text.startswith("/n"))
-async def set_n(m: Message):
-    try: val = float(m.text.split()[1])
-    except: return await m.answer("Формат: /n 2.5")
+@dp.message_handler(lambda msg: msg.text and msg.text.startswith("/n"))
+async def set_n_cmd(m: Message):
+    parts = m.text.split()
+    if len(parts) < 2:
+        return await m.answer("Формат: /n 2.5")
+    try:
+        val = float(parts[1])
+    except:
+        return await m.answer("Формат: /n 2.5")
     async with aiosqlite.connect(DB) as db:
         uid, n, state = await get_user(db, m.from_user.id)
-        await db.execute("UPDATE users SET n=? WHERE id=?", (val, uid)); await db.commit()
-    await m.answer(f"Шаг прибавки: {val} кг")
+        await db.execute("UPDATE users SET n=? WHERE id=?", (val, uid))
+        await db.commit()
+    await m.answer(f"Шаг прибавки установлен: {val} кг")
 
-@dp.message(F.text == "/swap")
+@dp.message_handler(commands=['swap'])
 async def swap(m: Message):
     async with aiosqlite.connect(DB) as db:
         uid, n, state = await get_user(db, m.from_user.id)
         next_state = {"A":"B","B":"C","C":"D","D":"A"}[state]
-        await db.execute("UPDATE users SET plan_state=? WHERE id=?", (next_state, uid)); await db.commit()
+        await db.execute("UPDATE users SET plan_state=? WHERE id=?", (next_state, uid))
+        await db.commit()
     await m.answer(f"Следующий день: {next_state}")
 
-@dp.message(F.text == "/today")
+@dp.message_handler(commands=['today'])
 async def today(m: Message):
     async with aiosqlite.connect(DB) as db:
         uid, n, state = await get_user(db, m.from_user.id)
@@ -114,13 +125,21 @@ async def today(m: Message):
             lines.append(f"• {it['exercise']}: {it['sets']}×{it['reps']} @ {w:.1f} кг")
         await m.answer("\n".join(lines))
 
-@dp.message(F.text.regexp(r"^(✅|🟡|❌)"))
+@dp.message_handler(regexp=r"^(✅|🟡|❌)")
 async def log_set(m: Message):
-    parts = m.text.split(); mark = parts[0]; ex = " ".join(parts[1:-3]) if "—" in m.text else parts[1]
-    # ищем число перед "—"
-    nums = [p for p in parts if p.replace('.','',1).isdigit()]
-    if not nums: return
+    parts = m.text.split()
+    mark = parts[0]
+    # Вес — первое число с точкой/без
+    nums = [p for p in parts if p.replace('.', '', 1).isdigit()]
+    if not nums:
+        return
     w = float(nums[0])
+    # Имя упражнения — всё между маркером и числом
+    ex_tokens = []
+    for p in parts[1:]:
+        if p == nums[0]: break
+        ex_tokens.append(p)
+    ex = " ".join(ex_tokens)
     async with aiosqlite.connect(DB) as db:
         uid, n, _ = await get_user(db, m.from_user.id)
         cur_w, fails = await get_weight(db, uid, ex, w)
@@ -140,13 +159,7 @@ async def log_set(m: Message):
                 await set_weight(db, uid, ex, cur_w, fails)
                 await m.answer(f"{ex}: зафиксировал неудачу ({fails}/2). Вес пока {cur_w:.1f} кг")
 
-async def main():
-    await init_db()
-    dp["bot"] = bot
-    await dp.start_polling(bot)
-
 if __name__ == "__main__":
-    import sys
     if not TOKEN:
-        print("Set TG_TOKEN env var"); sys.exit(1)
-    asyncio.run(main())
+        raise SystemExit("Set TG_TOKEN env var")
+    executor.start_polling(dp, skip_updates=True)
